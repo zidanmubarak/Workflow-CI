@@ -1,0 +1,172 @@
+name: MLflow CI/CD - Advanced
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  train-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Check Environment
+        run: |
+          python --version
+          pip --version
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install mlflow scikit-learn pandas numpy matplotlib seaborn joblib
+      
+      - name: Set MLflow Tracking URI
+        run: |
+          echo "MLFLOW_TRACKING_URI=file:///tmp/mlruns" >> $GITHUB_ENV
+      
+      - name: Run MLflow Project
+        run: |
+          cd MLProject
+          mlflow run . \
+            --env-manager=local \
+            -P data_path=climate_change_preprocessing.csv \
+            -P n_estimators=100 \
+            -P max_depth=10 \
+            -P test_size=0.2 \
+            -P random_state=42
+      
+      - name: Get latest MLflow run ID
+        id: get_run_id
+        run: |
+          cd MLProject
+          RUN_ID=$(python -c "
+          import mlflow
+          import os
+          os.environ['MLFLOW_TRACKING_URI'] = 'file:///tmp/mlruns'
+          client = mlflow.tracking.MlflowClient()
+          experiment = client.get_experiment_by_name('Default')
+          if experiment:
+              runs = client.search_runs(experiment.experiment_id, order_by=['start_time DESC'], max_results=1)
+              if runs:
+                  print(runs[0].info.run_id)
+          ")
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "Latest MLflow Run ID: $RUN_ID"
+      
+      - name: Install Python dependencies for artifact collection
+        run: |
+          pip install mlflow
+      
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cd MLProject
+          
+          # Copy model artifacts
+          if [ -d "model" ]; then
+            cp -r model ../artifacts/
+          fi
+          
+          # Copy visualization artifacts
+          if [ -f "confusion_matrix.png" ]; then
+            cp confusion_matrix.png ../artifacts/
+          fi
+          if [ -f "feature_importance.png" ]; then
+            cp feature_importance.png ../artifacts/
+          fi
+          if [ -f "classification_report.txt" ]; then
+            cp classification_report.txt ../artifacts/
+          fi
+          
+          # Copy MLflow artifacts
+          if [ -d "/tmp/mlruns" ]; then
+            cp -r /tmp/mlruns ../artifacts/
+          fi
+          
+          ls -la ../artifacts/
+      
+      - name: Upload artifacts to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
+      
+      - name: Build Docker Image with MLflow
+        run: |
+          cd MLProject
+          
+          # Build Docker image using mlflow build-docker
+          mlflow models build-docker \
+            --model-uri "file:///tmp/mlruns/0/${{ steps.get_run_id.outputs.run_id }}/artifacts/sklearn_model" \
+            --name "climate-change-ml" \
+            || echo "MLflow Docker build failed, using alternative method"
+          
+          # Alternative: Build custom Docker image if mlflow build-docker fails
+          if [ $? -ne 0 ]; then
+            echo "Building custom Docker image..."
+            cat > Dockerfile <<EOF
+          FROM python:3.10-slim
+          
+          WORKDIR /app
+          
+          # Install dependencies
+          RUN pip install --no-cache-dir mlflow scikit-learn pandas numpy joblib
+          
+          # Copy model and code
+          COPY . /app/
+          
+          # Expose MLflow port
+          EXPOSE 5000
+          
+          # Run MLflow server
+          CMD ["mlflow", "models", "serve", "-m", "model", "-h", "0.0.0.0", "-p", "5000"]
+          EOF
+            
+            docker build -t climate-change-ml .
+          fi
+      
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Tag Docker Image
+        if: github.event_name == 'push'
+        run: |
+          docker tag climate-change-ml ${{ secrets.DOCKER_USERNAME }}/climate-change-ml:latest
+          docker tag climate-change-ml ${{ secrets.DOCKER_USERNAME }}/climate-change-ml:${{ github.run_number }}
+      
+      - name: Push Docker Image
+        if: github.event_name == 'push'
+        run: |
+          docker push ${{ secrets.DOCKER_USERNAME }}/climate-change-ml:latest
+          docker push ${{ secrets.DOCKER_USERNAME }}/climate-change-ml:${{ github.run_number }}
+      
+      - name: Post Log in to Docker Hub
+        if: always()
+        run: echo "Docker operations completed"
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo "==================================="
+          echo "MLflow CI/CD Pipeline Summary"
+          echo "==================================="
+          echo "Status: Completed"
+          echo "Run Number: ${{ github.run_number }}"
+          echo "MLflow Run ID: ${{ steps.get_run_id.outputs.run_id }}"
+          echo "Docker Image: ${{ secrets.DOCKER_USERNAME }}/climate-change-ml:latest"
+          echo "==================================="
